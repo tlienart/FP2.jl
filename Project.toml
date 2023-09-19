@@ -1,0 +1,15 @@
+name = "FP2"
+uuid = "c78977f6-0c7c-4296-b824-aa3602256104"
+authors = ["tlienart <tlienart@me.com>"]
+version = "0.1.0"
+
+[deps]
+Automa = "67c07d97-cdcb-5c2c-af73-a7f9c32a568b"
+REPL = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+
+[targets]
+test = ["Test", "Random"]

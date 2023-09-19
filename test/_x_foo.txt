@@ -1,0 +1,1441 @@
+<!-- 
+This is a real page taken from Kevin Bonham's blogpost
+ -->
+
++++
+using Dates
+
+title = "Matching Publications to PubMed IDs"
+date = Date("2017-12-10")
+draft = false
+type = "post"
+category = "science"
+tags = ["gender", "publishing", "science", "diversity", "code", "julia"]
++++
+
+Earlier this week, I got an e-mail from Lucia Santamaria from the "[Gender Gap in
+Science][gendergap]" project from the International Council for Science. They are
+trying to systematically measure the gender gap in a number of ways, including
+looking at publication records. One of the important parts of their effort is to
+find ways to validate methods of gender assignment or inference.
+
+Lucia was writing about some data found in [the paper I wrote with with Melanie
+Stefan][genderpaper] about women in computational biology. In particular, she
+wanted the dataset that we got from Filardo et. al. that had a list of ~3000
+journal articles with known first-author genders. This is a great dataset to
+have, since the authors of that paper did all the hard work of actually going
+one-by-one through papers and finding the author genders by hand (often
+searching institutional websites and social media profiles for pictures etc).
+
+This allowed us to validate our gender inference based on author first name
+against a dataset where the truth is known (it did pretty well).
+
+![checking gender inference against known genders](/assets/img/gender_supp1c.png)
+
+And that's what Lucia wants to do as well. There's just one problem: the
+form of the data from Filardo and colleagues is human-readable, but not machine-
+readable[^dataset]. For example, one row of the data looks like this:
+
+[^dataset]: The input datasets used in this post are available through the Open Science Framework: https://osf.io/hs6ut/
+
+| `Article_ID` | `Full_Title` | `Link_to_Article` | `Journal` | `Year` | `Month` | `First Author Gender` |
+|------------|------------|-----------------|---------|------|-------|---------------------|
+| Aaby et al. (2010) | Non-specific effects of standard measles vaccine at 4.5 and 9 months of age on childhood mortality: randomised controlled trial | NA | BMJ | 2010 | 12 - Dec | Male |
+
+What we'd really like to have is some unique identifier (eg the Pubmed ID or
+doi) associated with each record. That would make it much easier to cross-
+reference with other datasets, including the table of hundreds of thousands of
+publications that we downloaded as part of this study. I had this when we
+published - it's how we validated our method, but I'm embarrassed to say it
+didn't get included with the paper, and I recently had to delete my old computer
+backups which is the only place it lived.
+
+I told her how we initially did this, and it sounds like she managed to make it
+work herself, but I thought it would be worth documenting how I did it
+originally (and maybe improve it slightly). So we've got a table with titles,
+author last names, years, and journals, and what we want is a pubmed id or doi.
+
+I'm using [julia][julialang] as my go-to language these days, and the first step
+is to load in the table as a dataframe that we can manipulate:
+
+
+```julia
+using DataFrames
+using CSV
+
+df = CSV.read("data/known-gender.csv")
+
+# get an array with the "article id" as a string
+ids = Vector{String}(df[:Article_ID])
+@show ids[1]
+```
+---
+```
+ids[1] = "Aaby et al. (2010)"
+```
+
+We can see that the current form of the `:Article_ID` has both author name and
+the year, but we want to be able to handle these separately. But they all take
+the same form, the author name, sometimes followed by "et al.", followed by the
+year in parentheses[^caveat]. So I'm going to use regular expressions, which
+can look like gobbledegook if you're not familiar with it. It's beyond the scope
+of this post to describe it, but I highly recomend [regexr][regexr] as a resource for
+learning and testing. The regex I used for this is composed of 3 parts:
+
+[^caveat]: I should note that in the version Filardo et. al. originally sent me, this was waaaay more heterogeneous. Some things had `et. all.` or `et al`, the years weren't always in parentheses etc. I did a lot of manual curration before it got to this point.
+
+- The author name, which can have some number of letters, spaces, `-`, and `'`: `([\w\s\-']+)`
+  - these are also at the beginning of the line, so I add a `^` (just to be safe)
+- Then "et al.": ` et al\.`
+  - the `.` is a special character, so it's escaped with `\ `
+  - this is also optional, so I wrap it in parentheses and add `?`
+- The year, which is 4 digits, and wrapped in parentheses: `\((\d{4})\)`
+  - the inner parentheses are so I can grab it as a group
+  - it should be the end, so I finish with `$`
+
+So, the [complete regex][regexr_demo] : `^([\w\s\-']+)( et al\.)? \((\d{4})\)$`
+
+And now I want to apply that search to everything in the `Article_ID` column:
+
+```julia
+# confirm this matches every row
+length(ids) # --> 3204
+sum(.!ismatch.(r"^([\w\s\-']+)( et al\.)? \((\d{4})\)$", ids)) # --> 3204
+
+# apply match across the whole ids array with `match.()`
+matches = match.(r"^([\w\s\-']+)( et al\.)? \((\d{4})\)$", ids)
+# get the last name of first authors
+firstauthors = [m.captures[1] for m in matches]
+# get the year... yeah there's a column for this, but since we have it...
+years = [parse(Int, m.captures[3]) for m in matches]
+```
+---
+```
+3204-element Array{Int64,1}:
+ 2010
+ 2007
+     ⋮
+ 2007
+ 2011
+```
+
+We also have a column for the journal names, but pubmed searching is a bit
+idiosyncratic and works better if you use the right abreviations. So next, I
+built a dictionary of abbreviations, and used an array comprehension to get a
+new array with the journal names:
+
+```julia
+journals = Vector{String}(df[:Journal])
+
+replacements = Dict(
+    "Archives of Internal Medicine" => "Arch Intern Med",
+    "Annals of Internal Medicine" => "Ann Intern Med",
+    "The Lancet" => "Lancet",
+    "NEJM" => "N Engl J Med"
+    )
+
+journals = [in(x, keys(replacements)) ? replacements[x] : x for x in journals]
+```
+---
+```
+3204-element Array{String,1}:
+ "BMJ"
+ "Ann Intern Med"
+ ⋮
+ "Lancet"
+ "Ann Intern Med"
+```
+Finally, words like "and", "in", "over" don't help a lot when searching, and the
+titles currently have special characters (like `:` or `()`) that also don't help
+or could even hurt our ability to search. So I took the title column, and built
+new strings using only words that are 5 characters or more. I did this all in
+one go, but to explain, the `matchall()` function finds all of the 5 or more
+letter words (that's `\w{5,}` in regex) and returns an array of matches. Then
+the `join()` function puts them together in a single string (separated by a
+space since I passed `' '` as an argument):
+
+```julia
+titles = join.(matchall.(r"\w{5,}", Vector{String}(df[:Full_Title])), ' ')
+```
+---
+```
+3204-element Array{String,1}:
+ "specific effects standard measles vaccine months childhood mortality randomised controlled trial"
+ "Tiotropium Combination Placebo Salmeterol Fluticasone Salmeterol Treatment Chronic Obstructive Pulmonary Disease Randomized Trial"
+ ⋮
+ "Artemether lumefantrine versus amodiaquine sulfadoxine pyrimethamine uncomplicated falciparum malaria Burkina randomised inferiority trial"
+ "Patient Interest Sharing Personal Health Record Information Based Survey"
+```
+
+So now we've got all the elements of our search, and I just put them into an
+array of tuples to make them easier to deal with:
+
+```julia
+searches = collect(zip(titles, firstauthors, journals, years))
+```
+---
+```
+3204-element Array{Tuple{String,SubString{String},String,Int64,Int64},1}:
+ ("specific effects standard measles vaccine months childhood mortality randomised controlled trial", "Aaby", "BMJ", 12, 2010)
+ ("Tiotropium Combination Placebo Salmeterol Fluticasone Salmeterol Treatment Chronic Obstructive Pulmonary Disease Randomized Trial", "Aaron", "Ann Intern Med", 4, 2007)
+ ⋮
+```
+
+Finally, I iterated through this array and composed searches, using the
+[`BioServices.EUtils`][bioservices] package to do the search and retrieval.
+
+```julia
+using BioServices.EUtils
+
+for s in searches
+    # If you do too many queries in a row, esearch raises an exception.
+    # The solution is to pause (here for 10 sections) and then try again.
+    try
+        res = esearch(db="pubmed", term="($(s[1]) [title]) AND ($(s[2]) [author]) AND ($(s[3]) [ journal]) AND ($(s[4]) [pdat])")
+    catch
+        sleep(10)
+        res = esearch(db="pubmed", term="($(s[1]) [title]) AND ($(s[2]) [author]) AND ($(s[3]) [ journal]) AND ($(s[4]) [pdat])")
+    end
+
+
+    doc = parsexml(res.data)
+    #= this returns an array of pmids, since in the xml, they're separated by
+    newlines. The `strip` function removes leading and trailing newlines, but
+    not ones in between ids. =#
+    i = split(content(findfirst(doc, "//IdList")) |> strip, '\n')
+
+    if length(i) == 1
+        #= if no ids are returned, there's an array with just an empty string,
+        in which case I add 0 to the array =#
+        length(i[1]) == 0 ? push!(pmids, 0) : push!(pmids, parse(Int, i[1]))
+    else
+        # if there are more than 1 pmids returned, I just add 9 to the array
+        push!(pmids, 9)
+    end
+end
+```
+
+I actually did better than the last time I tried this - 2447 records associated
+with only 1 pmid. 13 of the searches had more than 1 pmid, and the rest (744)
+didn't return any hits.
+
+```julia
+@show sum(pmids .> 9)
+@show sum(pmids .== 9)
+@show sum(pmids .== 0)
+```
+---
+```
+sum(pmids .> 9) = 2447
+sum(pmids .== 9) = 13
+sum(pmids .== 0) = 744
+```
+
+I added the ids to the dataframe and saved it as a new file (so I don't have to
+do the searching again). Since I have the urls for many of the papers, I was
+thinking I could try to identify the doi's associated with them from their
+webpages, but that will have to wait until another time.
+
+For now, the last step is to save it as a csv and send it off to Lucia:
+
+```julia
+CSV.write("data/withpmids.csv", df)
+```
+
+[gendergap]: https://icsugendergapinscience.org/work-packages/publication-patterns/
+[genderpaper]: https://doi.org/10.1371/journal.pcbi.1005134
+[julialang]: http://julialang.org
+[regexr]: https://regexr.com/
+[regexr_demo]: https://regexr.com/3hpod
+[bioservices]: https://github.com/BioJulia/BioServices.jl
+<!--
+LAST REVISION: Jan 12, 2022  (full page ok)
+ -->
+
++++
+showtoc = true
+header = "Markdown basics"
+menu_title = "Basics"
++++
+
+<!-- avoid having dummy example headings in the toc -->
+{{rm_headings level_1 level_2 level_3 a_text a_text__2}}
+
+## Overview
+
+Many of you will already be familiar with some flavour of Markdown such as [GitHub Markdown](https://docs.github.com/en/github/writing-on-github/getting-started-with-writing-and-formatting-on-github/basic-writing-and-formatting-syntax)
+or [CommonMark](https://commonmark.org/).
+Franklin can be seen as yet another flavour of Markdown with extensions.
+
+This page covers the Markdown basics that you should find to be broadly identical to standard Markdown along with some notes in the cases where there may be a noteworthy difference.
+
+## Text
+
+### Emphasis
+
+You can fence a block of text with '`*`' to change its emphasis (bold, italic):
+
+\showmd{
+  *italic* **bold** ***bold+italic***
+}
+
+This also works if you use '`_`' instead of '`*`' (though you should be consistent:
+an open '`_`' should be closed by a matching '`_`'):
+
+\showmd{
+    _italic_ __bold__ ___bold+italic___
+}
+
+and you can nest emphasis styles:
+
+\showmd{
+  _italic **bold+italic**_
+}
+
+\lskip
+
+### Paragraphs
+
+When converting text, sets of consecutive "inline" blocks will be grouped
+and placed within a paragraph (in HTML: `<p>...</p>`).
+The main inline blocks are:
+
+* a block of text not separated by an empty line possibly including emphasised
+text and special characters,
+* inline code and inline maths (see [extensions](/syntax/extensions/)),
+* latex-like commands (see [extensions](/syntax/extensions/)).
+
+A paragraph will be interrupted by:
+
+* a line skip (empty line),
+* a "non-inline" block (for instance a heading, a code block or a div block
+  (see [extensions](/syntaxextensions/))),
+* the end of the page.
+
+If you want to introduce a line return without interrupting a paragraph,
+you can use a double backslash as in LaTeX:
+
+\showmd{
+  ABC \\ DEF
+}
+
+\lskip
+
+### Headings
+
+You can indicate headings with one or more adjacent '`#`' followed by a space and
+the heading title. There can be up to 6 '`#`' indicating the depth of the title
+though note that only 3 levels are supported in the LaTeX conversion:
+
+\showmd{
+  # Level 1
+  ## Level 2
+  ### Level 3
+}
+
+Headings are automatically made into link anchors (you can see this by hovering
+over the ones created above).
+This allows to easily link to parts of a page (as well as across pages).
+For instance `[link](#headings)` will give: [link](#headings).
+See also the [section on links](#links) below.
+
+If the text of a heading is unique, the anchor will generally be just that text, in lowercase,
+after replacing spaces and special characters by '`_`'.
+So for instance if there's a unique heading `My Heading` the associated anchor will
+be `#my_heading`. If there's several heading with the same text, the second heading
+anchor id will be followed by `__2` and so on.
+
+\showmd{
+  ## a text
+  ### a text
+}
+
+If you hover over the headings above, you'll see that the first one has id `#a_text`
+and the second one `#a_text__2`.
+
+
+\cmdiff{
+  CommonMark supports indicating level 1 and 2 headings by underlying them
+  with `===` or `---` ("_alt heading_") this is not supported in Franklin.  
+}
+
+### Special characters
+
+If you want to show the characters '`*`' or '`_`' or '`#`' (or other characters which
+  may have a meaning in Franklin), you should escape them with a backslash.
+  For instance:
+
+\showmd{
+  \* \_ \$ \` \@ \# \{ \} \~
+}
+
+The double backslash, like in LaTeX, works as a line break (see [below](#paragraphs)).
+Therefore, if you want to show the backslash character, you have to use its HTML entity `&#92;` or `&bsol;`.
+You can indeed also insert emojis or HTML-entities:
+
+\showmd{
+  ❌ 🐂 🔦 &amp; &pi; &#42; &bsol;
+}
+
+The online website [amp-what](https://www.amp-what.com/) is a great resource to figure
+out the HTML entity associated with a character.
+
+## Blockquotes
+
+A set of lines prefixed with '`>`' will form a blockquote including continuation lines (i.e. lines immediately after, not separated by an empty line):
+
+\showmd{
+
+  > This is a blockquote,
+  > this line is in the same blockquote,
+  and this one (continuation, still part of quote),
+  and this one (idem)
+
+  Here it's separate as there's a line skip.
+}
+
+There can be any formatting in the blockquote:
+
+\showmd{
+  > ABC
+  > DEF **GHI**
+
+}
+
+You can also skip lines which will act as a paragraph break _within_ the blockquote:
+
+\showmd{
+  > ABC
+  >
+  > GHI
+
+}
+
+You can also nest blockquotes (make sure you skip a line after the nested block as shown below to separate between the inner nested quote and the outer one):
+
+\showmd{
+  > ABC
+  > > DEF
+  > > GHI
+  >
+  > JKL
+
+}
+
+\lskip
+
+## Lists
+
+Lists are formed of one or more items indicated with a line starting with a '`*`', '`-`' or '`+`'
+(unordered list) or a number followed by a dot ('`.`') or a bracket ('`)`') (ordered list).
+Nesting is indicated with either a tab or two or more spaces.
+
+Here's a simple unordered list:
+
+\showmd{
+  * Apples
+  * Oranges, note that list item can be continued on
+  another line, that's fine as long as there's no line-skip
+  * Pears
+    * Bosc
+    * Bartlett
+}
+
+Here's a simple ordered list with an unordered nested list
+(note that after the first item indicator, the numbering is automatic
+and so we can use the same number multiple times):
+
+\showmd{
+  1. Apples
+  1. Oranges (the indicator for the second item onwards is ignored)
+  1. Pears
+    + Bosc
+    + Bartlett
+}
+
+The number of the first item of an ordered list indicates the starting number.
+So if you want an ordered list starting from 2 for instance you could do:
+
+\showmd{
+  2. Foo
+  1) Bar
+  1. Baz
+}
+
+Note again that the numbering used for the second, third etc items is irrelevant.
+
+List items can contain any "inline" element (e.g. emphasised text or maths):
+
+\showmd{
+  * variables $x, y$ and $z$ are _reals_,
+  * variables $i, j$ and $k$ are _integers_,
+  * the function `foo` does not have side-effects.
+}
+
+\cmdiff{
+  "Loose" lists (with line skips between items) are not supported in Franklin.
+}
+
+## Links
+
+You can insert a link by writing `[link title](link_url)`.
+For instance this is a link pointing to the Julia Lang website:
+
+\showmd{
+  [JuliaLang website](https://julialang.org)
+}
+
+Sometimes you'll want to link several time to the same location in which case
+it is convenient to define a _reference_ by writing `[Name Of Reference]: location` on a dedicated
+line and use the reference by specifying `[Name Of Reference]` somewhere in the text:
+
+\showmd{
+  [JuliaLang]: https://julialang.org
+  [Wikipedia]: https://wikipedia.org
+
+  Text pointing to [JuliaLang] and [Wikipedia] and here's a second one to
+  [JuliaLang].
+}
+
+The pointer to a reference can be placed before or after the reference.
+The name of the reference can have spaces in it (and letter case doesn't matter).
+The main constraint is that the reference definition must be on a dedicated line.
+Here's another example:
+
+\showmd{
+  Here's text and a link to [the JuliaLang Website].
+
+  [the julialang website]: https://julialang.org
+}
+
+You could also change the title to an existing reference by writing
+`[link title][the reference]`:
+
+\showmd{
+  [euler]: https://projecteuler.net/
+
+  These all point to the same location:
+  * [Project Euler][euler],
+  * [The Project Euler][euler],
+  * [euler].
+}
+
+\tip{
+  You might want to define link references that can be used on all your pages.
+  To do so, just place the reference definition on a line of your `config.md` file.
+  For instance [this reference][juliaweb] is defined in the current config file.
+}
+
+
+You might also sometimes want the link to appear as the location itself.
+For this, you can use the _autolink_ syntax `<location>`:
+
+\showmd{
+  Link to the JuliaLang website: <https://julialang.org>.
+}
+
+\cmdiff{
+  CommonMark allows a few other variants such as `[link](location "title")` or
+  references with `[name]: location "title"`.
+  These are not currently supported in Franklin.
+}
+
+### Internal links
+
+Every heading in Franklin automatically has an anchor attached to it for easy reference.
+For instance the current heading corresponds to the anchor id `internal_links`.
+To link to such an anchor, the same syntax as for links can be used except
+the path is `#id`, so for instance:
+
+\showmd{
+  [internal links](#internal_links)
+}
+
+The mapping from anchor name to anchor id does a few things like lowercasing the anchor name, replacing spaces with underscores, dropping special characters etc.
+For instance:
+
+* `This Is AN anchor Name` → `this_is_an_anchor_name`
+* `anchor α: _foo_` → `anchor_foo`
+
+You can check the generated id by hovering on the heading or inspecting the HTML.
+Alternatively, you can use global linking (see [next point](#global_internal_links)).
+
+You can place anchors anywhere you want with `\label{anchor name}`:
+
+\showmd{
+  \label{abcd}
+
+  and now [we refer to it](#abcd)
+}
+
+### Global internal links
+
+Franklin allows to link globally **across** pages by using `##` instead of `#`.
+For instance, there is a heading "_Cache and packages_" defined on the page `/syntax/code/`,
+and it can be linked to with:
+
+\showmd{
+  all three forms link to the same heading:
+
+  * [explicit](/syntax/code/#cache_and_packages)
+  * [implicit](##cache_and_packages)
+  * [implicit 2](## Cache and packages)
+}
+
+Observe that in the last case, the mapping `(anchor name) -> (anchor id)` step is implicit.
+There's a few additional notes for the global linking:
+
+1. if the anchor is defined on multiple pages, the current page has priority followed by whichever page was seen by Franklin last. This also means that using global linking is ambiguous for anchors that are defined on more than one page (e.g. if you have a section `Introduction` on several pages and want to refer to one, you should use explicit linking specifying the path).
+2. further to the previous point, you **can** use global linking for something defined on the _current_ page, e.g. `[link](## Internal links)`: [link](## Internal links); this is never ambiguous since the current page has priority.
+
+
+## Images
+
+Inserting images is very similar to inserting links except there's an additional
+exclamation mark to distinguish the two.
+The allowed syntax for images are:
+
+* `![](path)` inserts image at `path` without `alt`
+* `![alt](path)` inserts image at `path` with `alt`
+* `![id]` inserts reference image `id`
+* `![alt][id]` inserts reference image `id` with `alt`
+
+The path can be a relative path to the site root or a valid URL to a file.
+All images below are taken from [Wikimedia Commons](https://commons.wikimedia.org/wiki/Main_Page).
+
+\showmd{
+  ![](/assets/eximg/zebra.svg)
+  ![camel](/assets/eximg/camel.svg)
+}
+
+For reference images, the syntax is the same as for link references. You can also
+add these references in your `config.md` to make them globally available.
+
+\showmd{
+  [frog]: https://upload.wikimedia.org/wikipedia/commons/0/08/Creative-Tail-Animal-frog.svg
+  [flamingo]: /assets/eximg/flamingo.svg
+
+  ![frog]
+  ![a flamingo][flamingo]
+}
+
+\lskip
+
+## Code
+
+To show code, you can use one or two backticks for _inline_ code
+and three to five backticks for _block_ code.
+Let's see the **inline** case:
+
+\showmd{
+  Inline code: `abc` or ``a`bc``
+}
+
+Observe that the inline code doesn't break the paragraph.
+Using double backticks allow to show single backticks in the code without that
+closing the environment.
+
+For **code blocks** (three to five backticks) you can optionally indicate the language of the code
+which is useful if you use a library for code highlighting (Franklin templates
+use [highlight.js](hljs) by default).
+
+\showmd{
+  ```julia
+  function foo(x::Int)
+    println("hello"^x)
+  end
+  ```
+}
+
+If no language is specified, the default language is drawn from the `lang` [page variable](/syntax/vars+funs/).
+
+If you want to show a code block within a code block, increase the number of ticks.
+For instance in the example below we show a triple-tick code block within a markdown code block
+which has 4 ticks.
+
+\showmd{
+  ````markdown
+  ```julia
+  abstract type Foo end
+  ```
+  ````
+}
+
+Franklin supports running Julia code blocks and showing or using the output
+of such code blocks. This can be very useful in tutorials for instance.
+See [the page on executed code blocks](/syntax/code/) for more on the topic.
+
+
+## Horizontal rules
+
+If a line contains exclusively 3 or more consecutive of either '`-`', '`*`' or '`_`', a
+horizontal rule will be inserted:
+
+\showmd{
+  ABC
+  ---
+  DEF
+  ***
+  GHI
+  ___
+}
+
+Any additional character of the same type appearing on that line will be ignored:
+
+\showmd{
+  --- --- --- - -- --- ------
+  **** *
+  ___________________________
+}
+<!--
+LAST REVISION: Jan 14, 2022 (full page ok)
+ -->
+
+
++++
+showtoc = true
+header = "Code blocks (part 1)"
+menu_title = header
++++
+
+\newcommand{\triplebt}{~~~<code>&#96;&#96;&#96;</code>~~~}
+~~~
+<style>
+img.code-figure {
+  max-width: 50%;
+}
+</style>
+~~~
+
+## Overview
+
+Franklin supports executing Julia code blocks and using or showing their output.
+Here is a basic example:
+
+\showmd{
+  ```julia:example
+  # a very simple code 'cell'
+  a = 1
+  ```
+}
+
+At a high level, this both shows the code on the webpage (as illustrated above)
+and also uses the running Julia session to execute the code so that the output
+can be shown somewhere else via the `\show` command:
+
+\showmd{
+  \show{example}
+}
+
+The orange box helps indicate what corresponds to the output of an executed code cell.
+This is just the styling we use on the present site though, you can of course control this
+yourself by styling the class `.code-output` or one of the more specific sub-classes
+(see [the section on code output](#output_of_executable_code_blocks)).
+
+The syntax
+
+````markdown
+```julia:name
+...
+```
+````
+
+identifies a fenced code block as "executable" and assigns a name '`name`' which
+allows to refer specifically to the output of that code block.
+
+The command `\show{name}` then displays `stdout`, `stderr` and the result of
+the code block if it's not `nothing`.
+
+\note{
+  At the moment, only Julia code can be executed, though of course you can use
+  [PyCall] or [RCall] to execute Python or R code.
+  This is [illustrated in the examples](#executing_python_code).
+}
+\lskip
+
+## Syntax for executable code blocks
+
+Beyond the syntax introduced briefly above, there are several other ways of indicating
+that a fenced code block should be executed:
+
+* \triplebt`julia:name` &mdash; the language and the name of the block are explicit,
+* \triplebt`:name` &mdash; the language is implicit, the name of the block is explicit,
+* \triplebt`:` &mdash; the language and the name are implicit.
+
+For all these you can swap the colon (`:`) for an exclamation mark (`!`) with the same
+effect (see examples below).
+
+\note{
+  When specifying the language, you can add a whitespace before the execution symbol
+  to help editors such as VSCode to highlight the code block properly.
+  For instance:
+  ````
+  ```julia !ex
+  ...
+  ```
+  ````
+}
+
+
+When the language is implicit, it is taken from the page variable `lang` (with default
+ `"julia"`).
+When the name is implicit, a name is automatically generated and the output is placed
+directly below the code.
+
+Here's an example with implicit language and explicit name:
+
+\showmd{
+  ```:abc
+  println("hello")
+  ```
+}
+
+\showmd{
+  \show{abc}
+}
+
+And here's an example with implicit language and implicit name (the output is shown
+  automatically below the code):
+
+\showmd{
+  ```!
+  1//2^2
+  ```
+}
+
+Unless you intend to show the code output somewhere else than below the code block,
+or use a custom method to show the code output, this last syntax (where everything is implicit)
+is likely the one you will want to use most often.
+
+\tip{
+  When debugging, you might like to double the execution marker (`!!` or `::`) which will force
+  the cell to be re-evaluated; this can be useful for debugging but should be removed as soon as
+  you fixed the problem as it otherwise incurs unnecessary cost when building the site.
+  See also [what to do when things go wrong](#what_to_do_when_things_go_wrong) below.
+}
+
+### Hiding lines of code
+
+In some cases an executable code cell might need some lines of code to work which you don't
+want to show.
+You can indicate that a line should be hidden by adding `#hide` to it (letter case and whitespace
+  don't matter).
+If you want to hide an entire code cell (e.g. you're just interested in the output)
+you can put `#hideall` in the code.
+
+\showmd{
+  ```!
+  using Random #hide
+  randstring(5)
+  ```
+}
+
+\showmd{
+  ```!
+  #hideall
+  a = 5
+  b = 7
+  println(a+b)
+  true
+  ```
+}
+
+\lskip
+
+
+### Mock lines
+
+In some cases you might want to show a line of code without it being run.
+The example below should make this clearer:
+
+```
+data = fetch("./tests/data.txt") # <-- depends on your setup
+data = fetch("/user/$name/api")  # <-- what the user should do
+
+plot(data)
+```
+
+In this example, you'd want to _run but hide_ the first line and _not run but show_ the second
+line.
+You already know `#hide`, the other one is `#mock` (also allowed: `#fake`, `#noexec`, `#norun`).
+
+\showmd{
+  ```!
+  println("hello")   # hide  <-- executed, not shown
+  println("not run") # mock  <-- shown, not executed
+  ```
+}
+
+
+### Providing name hints
+
+For auto-named code blocks (which you likely will want to use most of the time), you can provide
+a name hint which will help identify what is being evaluated in the REPL output when you
+build your site.
+
+So for instance if you just write
+
+\showmd{
+  ```!
+  println("hello")
+  ```
+}
+
+when the page gets built, something like
+
+```
+evaluating cell auto_cell_5...
+```
+
+will be shown in the REPL.
+But it can sometimes be useful to know precisely which block is being run and you can do
+this by adding a "`# name: name hint`" line in your code:
+
+\showmd{
+  ```!
+  # name: printing example
+  println("hello!")
+  ```
+}
+
+then, when the page gets built, something like
+
+```
+evaluating cell auto_cell_5 (printing example)...
+```
+
+will be shown in the REPL.
+
+
+### Marking a cell as independent
+
+If a code block is fully independent of any other code blocks on the page, **and** of the `Utils` module, you can mark it as _independent_ (with `# indep`), this will allow Franklin to skip re-evaluating this block when other code blocks around it change.
+
+To clarify this, imagine you have a page with two blocks _A_ and _B_.
+By default if _A_ is modified, _B_ will be re-evaluated because Franklin considers that _B_ might
+depend on some things that _A_ defines.\\
+However, if you know that _B_ is fully independent code, you can mark it as such and then when _A_ changes, _B_ will **not** get re-evaluated.
+
+When marking a block as independent, the user guarantees to Franklin that:
+1. the code does not depend on any other code block on the page,
+1. no other code block on the page depends on that code block.
+
+The marker for independence should be placed at the top of your code:
+
+\showmd{
+  ```!
+  # indep
+  x = 5
+  println(x^2)
+  ```
+}
+
+\tip{
+  If all your code blocks are fast-running, you can ignore the `indep` trick.
+  However if a block takes time to run, and you know that it is independent
+  in the sense mentioned above, marking it explicitly will help make page reloads faster.
+}
+
+## REPL mode
+
+Instead of `!` or `:` above, you can also use one of `>`, `;`, `]` and `?` to
+mimick the corresponding REPL mode.
+In the case of the `?` one, only a single line of input is allowed (other lines,
+if provided, will be ignored).
+
+#### REPL common mode
+
+With the `>`, you indicate that the code cell should be split in the same way
+as it would in the REPL:
+
+\showmd{
+  ```>
+  a = 5
+  b = 2;
+  c = a + 3b
+  println(c^2)
+  ```
+}
+
+#### REPL shell mode
+
+With the `;`, you indicate that the code cell should be executed as in the 
+REPL shell mode:
+
+\showmd{
+  ```;
+  echo abc
+  date
+  ```
+}
+
+#### REPL pkg mode
+
+With the `]`, you indicate that the code cell should be executed as in the
+REPL pkg mode, note that this will affect the environment the subsequent cells
+are run in (only on that page, it won't affect the other pages which will
+keep being run in the website environment unless otherwise specified):
+
+```!
+#hideall
+using Pkg
+pkg_path = Pkg.project().path;
+```
+
+\showmd{
+  ```]
+  activate --temp
+  add StableRNGs
+  st
+  ```
+  then
+  ```!
+  using StableRNGs
+  rand(StableRNG(1))
+  ```
+}
+
+```!
+#hideall
+Pkg.activate(pkg_path, io=IOBuffer());
+```
+
+#### REPL help mode
+
+With the `?`, you indicate that the code cell should be executed as in the
+REPL help mode. Note that only the first line of the cell will be considered
+as the output will be displayed in a separate `div` with class `repl-help`
+(which you should style).
+
+The basic styling used here is:
+
+\showmd{
+  ~~~
+  <style>
+  .repl-help {
+    margin-top: 1em;
+    margin-left: 1em;
+    padding: 1em;
+    background-color: #fefee8;
+    border: 1px solid yellow;
+    border-radius: 10px;
+    font-style: italic;
+  }
+  .repl-help h1 {
+    font-size: 1.1em;
+    padding-bottom: .5em;
+  }
+  .repl-help pre code.hljs {
+    background-color: transparent;
+  }
+  </style>
+  ~~~
+}
+
+\showmd{
+  ```?
+  im
+  ```
+}
+
+## Understanding how things work
+
+Each page can be seen as one "notebook".
+All executed code blocks on the page are executed in one sandbox module
+attached to that page and **share the same scope**.
+That sandbox module also loads the content of `utils.jl` as a `Utils` module
+and so all objects defined there can be accessed in any code block via
+`Utils.$name` (see also [the page on Utils](/syntax/utils/)).
+
+To illustrate the scoping, consider these two consecutive cells:
+
+\showmd{
+  ```!
+  #hideall
+  x = 3;
+  ```
+
+  ```!
+  y = x
+  @show y
+  ```
+}
+
+When a code block is executed, the code string as well as the output strings are
+cached.
+This allows for code blocks to not be systematically re-executed if they don't need to be.
+The cached representation can however be considered _stale_ in which case the code block
+will be re-evaluated as soon as the page changes.
+This can be mitigated with the use of `# indep` as [mentioned above](##Marking a cell as independent).
+When adding or modifying a code block, every code block below that one are considered stale,
+and so will be re-executed.
+
+Since `Utils` is loaded into the sandbox module attached to a page, if `utils.jl` changes,
+the entirety of each page's "notebook" will be marked as stale and will be re-run to guarantee
+that it uses the latest definitions from `Utils` (even if it doesn't use `Utils` at all).
+In that sense changing `utils.jl` amounts to clearing the entire cache and re-building
+the website (see also [the page discussing Utils](/syntax/utils/)).
+
+
+### What to do when things go wrong
+
+While hopefully this shouldn't happen too often, two things can go wrong:
+
+1. some code fails in an un-expected way (e.g.: it calls objects which it should have
+  access to but doesn't seem to),
+1. the output of an auto-cell is incorrect (either wasn't refreshed or some other random
+output that you didn't expect).
+
+In both cases, you can first try to force re-execute the cell and, if that fails, you can
+try clearing the cache:
+
+1. to force re-execute a cell, just double the execution marker (e.g. `!!` or `::`),
+1. to clear the page cache, interrupt the server, add the [page variable](/syntax/vars+funs/)
+  `ignore_cache = true` and re-start the server,
+1. to clear the entire site cache, interrupt the server and restart it passing the
+argument `clear = true` to `serve(...)` .
+
+In the first case, that cell along with all subsequent cells will be re-evaluated.
+In the second case, only the cache associated with the current page will be ignored and only
+that page will be (completely) re-evaluated.
+In the last case, the whole site is re-built from scratch.
+
+In any case, if you can reproduce what led to the problem, and you think it could be addressed
+on the Franklin side,  kindly open an issue on GitHub.
+
+## Output of executable code blocks
+
+
+When evaluating a code block, Franklin captures `stdout`, `stderr` and, if the code
+doesn't fail, the result of the execution.
+When using the command `\show` (or automatically if you use implicit naming), the output
+is placed in the following HTML:
+
+```html
+<div class="code-output">
+
+  <!-- If stdout is not empty -->
+  <pre><code clas="code-stdout language-plaintext">
+    ...captured stdout...
+  </code></pre>
+
+  <!-- if stderr is not empty -->
+  <pre><code class="code-stderr language-plaintext">
+    ...captured stderr...
+  </code></pre>
+
+  <!-- if result is not nothing -->
+   ...appropriate representation of the result...
+</div>
+```
+
+If the code block didn't fail, the _appropriate representation of the result_ is obtained by considering the following cases in order:
+
+1. the result is `nothing`, nothing gets shown (no string),
+1. there is a custom `html_show` function for `typeof(result)` that is defined
+in your `Utils`, the string returned by the call to that function is then added,
+1. the object has a `Base.show` method for `MIME"image/svg+xml"` or `MIME"image/png"`,
+the image is automatically saved to an appropriate location and shown (with priority to SVG output),
+1. the object has a `Base.show` method for `MIME"text/html"`, it gets called and the HTML gets shown,
+1. the object has a `Base.show` method for `MIME"text/plain"`, it gets called and shown in a `<pre><code class="code-result language-plaintext">...</code></pre>` block,
+1. otherwise, the fallback `Base.show` is called and shown as in the previous point in a `<pre><code...` block.
+
+Note that you can always suppress the display of a code block result by
+adding a final '`;`' to the code.
+These different cases are illustrated further below.
+
+\note{
+  When capturing `stdout` during a code-cell evaluation, the logging level is
+  such that `@info` and `@warn` won't show up.
+  This is to prevent getting spurious information being shown on your website from
+  packages precompiling upon CI deployment. \\
+  Long story short: avoid using these macros in your code cells.
+}
+
+You can also overwrite the `\show` command by defining a custom
+`lx_show` function in your utils (see [how to define latex commands](/syntax/utils/)) if you
+want to handle the output in your own way (or define your own alternative command that does it).
+
+
+### Nothing to show
+
+Nothing will be shown beyond `stdout` if
+
+* the last command in the code block is a `@show` or returns `nothing`
+* the last command in the code block is followed by '`;`'
+
+A few examples follow:
+
+\showmd{
+  ```!
+  a = 1//2
+  @show a   # ==> last command is a show
+  ```
+}
+
+\showmd{
+  ```!
+  println("hello")
+  1;       # ==>  ';' suppresses the output
+  ```
+}
+
+\showmd{
+  ```!
+  function foo()::Nothing
+      println("bar")
+      return
+  end
+  foo()    # ==> returns nothing
+  ```
+}
+
+### Default show
+
+For a result that does not have a custom show, is not showable as an image, or HTML,
+`Base.show` will be applied with a result similar to what you would get in the Julia REPL:
+
+\showmd{
+  ```!
+  true
+  ```
+}
+
+\showmd{
+  ```!
+  [1, 2, 3]
+  ```
+}
+
+One exception to this is if the result has a dedicated show method for `MIME"text/plain"` in which
+case that is what will be called and shown.
+
+
+### Showable as SVG or PNG
+
+If the result is showable as SVG or PNG then a relevant file (`.svg` or `.png`) is
+generated and the image is inserted with
+
+```html
+<img class="code-figure" src="...generated_path_to_img...">
+```
+
+~~~
+<!-- Avoiding snoopcompile stuff -->
+<style>
+.fig-stdout {height:0; visibility: hidden}
+</style>
+~~~
+
+
+For instance:
+
+\showmd{
+  ```!
+  # indep
+  using Colors
+  colorant"cornflowerblue"
+  ```
+}
+
+If you inspect the HTML, you will see that the image displayed corresponds to a generated path that looks like
+
+```plaintext
+/assets/syntax/code/figs-html/__autofig_1682931969501726440.svg
+```
+
+The generated path is built as
+
+```plaintext
+/assets/[relative-path]/figs-html/[gen]
+```
+
+where `relative-path` is the relative path to the page with the code and
+`gen` is built out of the hash of the code that generated the image:
+
+```!
+hash("""
+  using Colors
+  colorant"cornflowerblue"
+  """ |> strip
+  ) |> string
+```
+
+
+Here's another example with Gaston (and you could use any other plotting library such as
+[Plots](https://github.com/JuliaPlots/Plots.jl), [PlotlyJS](https://github.com/JuliaPlots/PlotlyJS.jl), etc., though you'll have to be careful about setting dependencies properly.
+Check out the [page dedicated to plots with Franklin](/extras/plots/) for more informations.
+
+```!
+# name: gaston
+# indep
+using Gaston
+set(term="svg")
+x = range(0, pi, length=350)
+z = 0.2 * randn(length(x))
+y = @. sin(exp(x)) * sinc(x) + z
+plot(x, y)
+```
+
+\note{
+  In order to show properly, the last object needs to be showable. With some
+  libraries such as PyPlot this requires an additional command to retrieve the
+  showable object (`gcf()` for PyPlot will return the figure which is showable).
+}
+
+
+### HTML show
+
+Some packages define objects which indicate how to show objects with a `MIME"text/html"`,
+in that case the corresponding `show` method is called and the HTML shown.
+This is for instance the case with DataFrame objects:
+
+```!
+# indep
+using DataFrames
+df = DataFrame(
+  (
+    names  = ["Vlad", "Martha", "Hasan", "Carl"],
+    age    = [50, 34, 23, 42],
+    gender = ["M", "F", "M", "M"]
+  )
+)
+```
+\lskip
+
+### Custom show
+
+If you have defined a custom `html_show(r)` in your `Utils` that accepts an object of the type
+of the result of a code block and returns a string, then that will be used to represent the
+result on the page.
+
+For instance in the `utils.jl` for the present website, we've defined
+
+```julia
+struct Foo
+    x::Int
+end
+html_show(f::Foo) = "<strong>Foo: $(f.x)</strong>"
+```
+
+We can use the type `Foo` by indicating it is defined in `Utils` and the custom show method will be used:
+
+\showmd{
+  ```!
+  Utils.Foo(1)
+  ```
+}
+
+\note{
+  Remember that you can refer to any object defined in `utils.jl` with the syntax `Utils.$name_of_object`.
+}
+\lskip
+
+### Showing the output as Markdown/HTML
+
+In some cases it can be convenient to use a code block to generate some markdown (resp. HTML).
+One way is to define a [utils function](/syntax/utils/) but you can also use the `\mdshow` (resp. `\htmlshow`) command
+which interprets the output of `stdout` and the string representation of the result as Markdown.
+
+Here's a simple illustration:
+
+\showmd{
+  ````!ex-mdshow
+  #hideall
+  println("```plaintext")
+  for i in 1:5
+    println("*"^i)
+  end
+  println("```")
+  ````
+
+  \mdshow{ex-mdshow}
+}
+
+Here's another one with `\htmlshow`:
+
+\showmd{
+  ```!ex-htmlshow
+  #hideall
+  println("<ul>")
+  for i in 1:5
+    println("<li>", "🌴"^i, "</li>")
+  end
+  println("</ul>")
+  ```
+  \htmlshow{ex-htmlshow}
+}
+
+
+
+### What if the code errors?
+
+If there's an error in the code, no result will be shown and `stderr` will
+capture a trimmed stacktrace of the problem which will be displayed:
+
+\showmd{
+  ```!
+  # name: error
+  # indep
+  sqrt(-1)
+  ```
+}
+\lskip
+
+### In what path does the code run?
+
+In the same path as where `serve` was called.
+And since you can call `serve()` from within the site folder or from elsewhere specifying
+`serve("path/to/folder")`, this path can vary.
+As a consequence, if you want some code to do something with a path (e.g. read or write a file),
+you should use `Utils.path(:folder)` as the base path pointing to your website folder.
+
+You can also use `Utils.path(:site)` as the base path pointing to the website build folder.
+
+\tip{
+  Out of convenience, you can also use `folderpath(...)` as
+  shorthand for `joinpath(Utils.path(:folder), ...)` (and, correspondingly,
+  `sitepath(...)`).
+}
+
+For instance let's say you want to save a DataFrame to a CSV that you can link to
+as an asset on your site:
+
+```!
+using DataFrames, CSV
+build_dir  = Utils.path(:site)
+target_dir = mkpath(joinpath(build_dir, "assets", "data"))
+df = DataFrame(A=1:4, B=["M", "F", "F", "M"])
+CSV.write(joinpath(target_dir, "data1.csv"), df);
+```
+
+this outputs nothing but it does save `data1.csv` in the build folder at location
+`/assets/data/` so that you could then link to it explicitly:
+
+\showmd{
+  click on [this link](/assets/data/data1.csv) to download the CSV corresponding
+  to the dataframe above.
+}
+
+Another example is that you might want to write a file in the build dir:
+
+```!
+build_dir = Utils.path(:site)
+open(joinpath(build_dir, "405.html"), "w") do f
+  write(f, """
+    Dummy page 405, <a href="/">return home</a>
+    """
+  )
+end;
+```
+
+The above code block writes a dummy HTLM page `405.html` in the build folder.
+You can actually see it [here](/405.html).
+
+\note{
+  Do not use absolute paths since those might not exist in a continuous integration
+  environment. Do use `Utils.path(:folder)` or `Utils.path(:site)`
+  as your base path and use `joinpath` to point to the specific location you care about.
+}
+
+[Next page](/syntax/code-2/)
